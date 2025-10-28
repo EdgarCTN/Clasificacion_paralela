@@ -14,7 +14,7 @@
  *  - Verifica que los datos se hayan ordenado correctamente.
  *  - Guarda los resultados de tiempo en "resultados.csv" para análisis posterior.
  *
- * Autor: Edgar Tejeda (2025)
+ * Grupo 5 _ Programacion Paralela
  * Sistema: Ubuntu/Linux
  */
 
