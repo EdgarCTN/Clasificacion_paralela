@@ -1,2 +1,10 @@
-# Clasificaci-n-paralela
-Repositorio creado para albergar el proyecto de "Clasificación paralela de grandes volúmenes de datos" del grupo 7
+# Clasificacion secuencial
+
+## 1. Generar un dataset grande
+seq 1 1000000 | shuf > dataset.csv
+
+## 2. Compilar
+gcc secuencial.c -o secuencial -O2
+
+## 3. Ejecutar
+./secuencial
