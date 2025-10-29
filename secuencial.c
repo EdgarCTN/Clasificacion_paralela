@@ -5,7 +5,7 @@
 #define REPETICIONES 5  // Número de veces que se repite el ordenamiento para promedio
 
 /*
- * Programa: secuencial_final_v2.c
+ * Programa: secuencial.c
  * Propósito: Medir el desempeño del ordenamiento secuencial (QuickSort)
  * sobre un dataset numérico grande en C.
  *
