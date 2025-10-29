@@ -22,3 +22,10 @@ mpicc mpi.c -o mpi -O2
 
 ## 4. Ejecutar
 mpirun -np 2 ./mpi
+
+# Clasificacion paralela - OpenMP (Divide y venceras)
+## 1. Compilar
+gcc openmp.c -o openmp -fopenmp -O2 -lm
+
+## 2. Ejecutar
+OMP_NUM_THREADS=4 ./openmp
