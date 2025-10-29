@@ -14,7 +14,7 @@ gcc secuencial.c -o secuencial -O2
 seq 1 1000000 | shuf > dataset.csv
 
 ## 2. Instalar MPI
-sudo apt update
+sudo apt update  
 sudo apt install -y openmpi-bin openmpi-common libopenmpi-dev
 
 ## 3. Compilar
