@@ -2,19 +2,21 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define REPETICIONES 5  // Número de veces que se repite el ordenamiento para promedio
+
 /*
- * Programa: secuencial_final.c
+ * Programa: secuencial_final_v2.c
  * Propósito: Medir el desempeño del ordenamiento secuencial (QuickSort)
  * sobre un dataset numérico grande en C.
- * 
- * Este programa:
- *  - Lee un archivo "dataset.csv" con una lista de valores numéricos.
- *  - Calcula estadísticas básicas (mínimo, máximo, promedio).
- *  - Ordena los datos con qsort() y mide el tiempo de ejecución.
- *  - Verifica que los datos se hayan ordenado correctamente.
- *  - Guarda los resultados de tiempo en "resultados.csv" para análisis posterior.
  *
- * Grupo 5 _ Programacion Paralela
+ * Este programa:
+ *  - Lee "dataset.csv" (una lista de valores numéricos separados por saltos de línea).
+ *  - Calcula estadísticas básicas (mínimo, máximo, promedio).
+ *  - Ordena los datos con qsort() varias veces para obtener un tiempo promedio.
+ *  - Verifica que los datos se hayan ordenado correctamente.
+ *  - Guarda los resultados (N, tiempo promedio, min, max, promedio) en "resultados.csv".
+ *
+ * Grupo 5 – Programación Paralela
  * Sistema: Ubuntu/Linux
  */
 
@@ -47,7 +49,6 @@ int main() {
     double *datos;
     long total = 0;
     double valor, min = 1e9, max = -1e9, suma = 0.0;
-    double inicio, fin;
 
     // Abrir el archivo con los datos
     archivo = fopen("dataset.csv", "r");
@@ -57,22 +58,29 @@ int main() {
     }
 
     // Contar cuántos datos contiene el archivo
-    while (fscanf(archivo, " %lf,", &valor) == 1) {
+    while (fscanf(archivo, "%lf", &valor) == 1) {
         total++;
     }
-    rewind(archivo); // Regresar al inicio del archivo
+    rewind(archivo);
+
+    if (total == 0) {
+        fprintf(stderr, "Error: el archivo dataset.csv está vacío o tiene formato incorrecto.\n");
+        fclose(archivo);
+        return 1;
+    }
 
     // Reservar memoria dinámica según la cantidad de datos
     datos = (double *)malloc(total * sizeof(double));
     if (datos == NULL) {
-        fprintf(stderr, "Error: no se pudo asignar memoria\n");
+        fprintf(stderr, "Error: no se pudo asignar memoria (%.2f MB requeridos)\n",
+                total * sizeof(double) / (1024.0 * 1024.0));
         fclose(archivo);
         return 1;
     }
 
     // Leer los datos y calcular estadísticas básicas
     for (long i = 0; i < total; i++) {
-        if (fscanf(archivo, " %lf,", &datos[i]) != 1) {
+        if (fscanf(archivo, "%lf", &datos[i]) != 1) {
             fprintf(stderr, "Error al leer dato %ld\n", i);
             free(datos);
             fclose(archivo);
@@ -84,42 +92,60 @@ int main() {
     }
     fclose(archivo);
 
+    double promedio = suma / total;
+
     printf("==========================================\n");
     printf("Datos cargados: %ld\n", total);
     printf("Valor mínimo: %.2f\n", min);
     printf("Valor máximo: %.2f\n", max);
-    printf("Promedio: %.2f\n", suma / total);
+    printf("Promedio: %.2f\n", promedio);
     printf("Memoria usada: %.2f MB\n", total * sizeof(double) / (1024.0 * 1024.0));
+    printf("Repeticiones para promedio: %d\n", REPETICIONES);
 
-    // Medir el tiempo de ordenamiento con qsort (QuickSort secuencial)
-    inicio = tiempo_actual();
-    qsort(datos, total, sizeof(double), comparar);
-    fin = tiempo_actual();
-
-    double tiempo = fin - inicio;
-    printf("\nTiempo de ordenamiento (QuickSort secuencial): %.6f segundos\n", tiempo);
-
-    // Verificar que los datos estén correctamente ordenados
-    if (verificar_orden(datos, total)) {
-        printf("Verificación: datos correctamente ordenados \n");
-    } else {
-        printf("Verificación: error, datos no están ordenados \n");
-    }
-
-    // Guardar datos ordenados (opcional)
-    FILE *salida = fopen("ordenado.csv", "w");
-    if (salida) {
-        for (long i = 0; i < total; i++) {
-            fprintf(salida, "%.6f\n", datos[i]);
+    // Medir el tiempo promedio de ordenamiento con qsort()
+    double tiempo_total = 0.0;
+    for (int r = 0; r < REPETICIONES; r++) {
+        // Duplicar los datos originales para no ordenar el mismo arreglo
+        double *copia = (double *)malloc(total * sizeof(double));
+        if (copia == NULL) {
+            fprintf(stderr, "Error: no se pudo asignar memoria para copia\n");
+            free(datos);
+            return 1;
         }
-        fclose(salida);
+        for (long i = 0; i < total; i++) copia[i] = datos[i];
+
+        double inicio = tiempo_actual();
+        qsort(copia, total, sizeof(double), comparar);
+        double fin = tiempo_actual();
+
+        tiempo_total += (fin - inicio);
+        free(copia);
     }
 
-    // Guardar los resultados en formato CSV (para análisis posterior)
+    double tiempo_promedio = tiempo_total / REPETICIONES;
+    printf("\nTiempo promedio (QuickSort secuencial): %.6f segundos\n", tiempo_promedio);
+
+    // Verificar orden en la última copia ordenada (solo una vez)
+    double *verif = (double *)malloc(total * sizeof(double));
+    for (long i = 0; i < total; i++) verif[i] = datos[i];
+    qsort(verif, total, sizeof(double), comparar);
+    int orden_ok = verificar_orden(verif, total);
+    free(verif);
+
+    if (orden_ok)
+        printf("Verificación: datos correctamente ordenados\n");
+    else
+        printf("Verificación: error, datos no están ordenados\n");
+
+    // Guardar resultados en formato CSV
     FILE *resultados = fopen("resultados.csv", "a");
     if (resultados) {
-        fprintf(resultados, "%ld,%.6f\n", total, tiempo);
+        fprintf(resultados, "%ld,%.6f,%.2f,%.2f,%.2f\n",
+                total, tiempo_promedio, min, max, promedio);
         fclose(resultados);
+        printf("\nResultados guardados en 'resultados.csv'\n");
+    } else {
+        fprintf(stderr, "Advertencia: no se pudo escribir en resultados.csv\n");
     }
 
     free(datos);
