@@ -1,183 +1,220 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <mpi.h>
-#include <sys/resource.h>
-
 /*
- * Programa: mpi.c
- * Propósito: Implementar un esquema "Divide y Vencerás" en paralelo usando MPI.
+ * ===============================================================
+ *  PROGRAMA: mpi_maestro_esclavo.c
+ *  PROPÓSITO:
+ *     Implementar un esquema Maestro–Esclavo (Master–Slave) en MPI
+ *     para realizar el ordenamiento paralelo de un dataset numérico
+ *     usando QuickSort y una fusión jerárquica.
  *
- * Este programa:
- *  - Carga un dataset numérico desde "dataset.csv" (solo el proceso maestro).
- *  - Divide el arreglo entre los procesos MPI (esquema maestro-esclavo).
- *  - Cada proceso ordena su segmento con qsort() (divide y vencerás local).
- *  - El maestro recolecta y combina los datos ordenados.
- *  - Mide el tiempo total y muestra estadísticas (memoria, min, max, promedio).
+ *  DESCRIPCIÓN GENERAL:
+ *     - El proceso Maestro (rank 0) lee todo el archivo dataset.csv.
+ *     - Divide los datos y los distribuye entre los procesos Esclavos.
+ *     - Cada Esclavo ordena su subconjunto de datos localmente.
+ *     - El Maestro recolecta los resultados y realiza la fusión final.
+ *     - Se repite el proceso varias veces para calcular un promedio.
  *
- * Compilación: mpicc mpi.c -o mpi -O2
- * Ejecución:   mpirun -np 4 ./mpi
- *
- * Sistema: Ubuntu/Linux
+ * ===============================================================
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <time.h>
+
+#define REPETICIONES 5  // Número de veces que se repite para promediar el tiempo
+
+// ---------------------------------------------------------------
+// Función comparadora usada por qsort
+// ---------------------------------------------------------------
 int comparar(const void *a, const void *b) {
-    double x = *(const double *)a;
-    double y = *(const double *)b;
+    double x = *(double *)a;
+    double y = *(double *)b;
     return (x > y) - (x < y);
 }
 
-double tiempo_actual() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
+// ---------------------------------------------------------------
+// Función de fusión: combina dos arreglos ordenados en uno nuevo
+// ---------------------------------------------------------------
+void merge(double *a, long n, double *b, long m, double *resultado) {
+    long i = 0, j = 0, k = 0;
+    while (i < n && j < m) {
+        if (a[i] < b[j]) resultado[k++] = a[i++];
+        else resultado[k++] = b[j++];
+    }
+    while (i < n) resultado[k++] = a[i++];
+    while (j < m) resultado[k++] = b[j++];
 }
 
-int verificar_orden(const double *datos, long total) {
-    for (long i = 1; i < total; i++) {
-        if (datos[i] < datos[i - 1]) return 0;
+// ---------------------------------------------------------------
+// Verifica si el arreglo está ordenado (control de calidad)
+// ---------------------------------------------------------------
+int verificar_orden(double *arr, long n) {
+    for (long i = 1; i < n; i++) {
+        if (arr[i] < arr[i - 1]) return 0;
     }
     return 1;
 }
 
-void fusionar(const double *a, long na, const double *b, long nb, double *resultado) {
-    long i = 0, j = 0, k = 0;
-    while (i < na && j < nb) {
-        if (a[i] < b[j]) resultado[k++] = a[i++];
-        else resultado[k++] = b[j++];
-    }
-    while (i < na) resultado[k++] = a[i++];
-    while (j < nb) resultado[k++] = b[j++];
-}
-
-// Calcular uso de memoria (en MB)
-double memoria_usada_MB() {
-    struct rusage uso;
-    getrusage(RUSAGE_SELF, &uso);
-#ifdef __linux__
-    return uso.ru_maxrss / 1024.0; 
-#else
-    return uso.ru_maxrss;
-#endif
-}
-
 int main(int argc, char *argv[]) {
     int rank, size;
-    MPI_Init(&argc, &argv);
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    double tiempo_total = 0.0;
 
-    double *datos = NULL;
-    double *subdatos = NULL;
-    long total = 0;
-    double inicio_global, fin_global;
+    MPI_Init(&argc, &argv);               // Inicializa el entorno MPI
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); // Obtiene el ID del proceso actual
+    MPI_Comm_size(MPI_COMM_WORLD, &size); // Obtiene el número total de procesos
 
-    if (rank == 0) {
-        FILE *archivo = fopen("dataset.csv", "r");
-        if (!archivo) {
-            fprintf(stderr, "Error: no se pudo abrir dataset.csv\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+    // Validación: se requiere al menos un maestro y un esclavo
+    if (size < 2) {
+        if (rank == 0)
+            fprintf(stderr, "Error: se requieren al menos 2 procesos (1 maestro + N esclavos)\n");
+        MPI_Finalize();
+        return 1;
+    }
 
-        double temp;
-        while (fscanf(archivo, " %lf,", &temp) == 1) total++;
-        rewind(archivo);
+    // ---------------------------------------------------------------
+    // Repetimos el experimento varias veces para promediar el tiempo
+    // ---------------------------------------------------------------
+    for (int rep = 0; rep < REPETICIONES; rep++) {
+        double inicio_global = MPI_Wtime();  // Inicio del cronómetro global
 
-        datos = (double *)malloc(total * sizeof(double));
-        if (!datos) {
-            fprintf(stderr, "Error: no se pudo asignar memoria\n");
-            fclose(archivo);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+        double *datos = NULL;
+        long total = 0;
 
-        for (long i = 0; i < total; i++) {
-            if (fscanf(archivo, " %lf,", &datos[i]) != 1) {
-                fprintf(stderr, "Error al leer dato %ld\n", i);
-                free(datos);
-                fclose(archivo);
+        // ===========================================================
+        // ROL DEL MAESTRO (rank 0)
+        // ===========================================================
+        if (rank == 0) {
+            FILE *archivo = fopen("dataset.csv", "r");
+            if (archivo == NULL) {
+                fprintf(stderr, "Error: no se pudo abrir dataset.csv\n");
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
-        }
-        fclose(archivo);
 
-        // Calcular estadísticas iniciales
-        double min = datos[0], max = datos[0], suma = 0.0;
-        for (long i = 0; i < total; i++) {
-            if (datos[i] < min) min = datos[i];
-            if (datos[i] > max) max = datos[i];
-            suma += datos[i];
-        }
-        double promedio = suma / total;
-        double memoria = memoria_usada_MB();
+            // Contar cuántos elementos hay
+            double valor;
+            while (fscanf(archivo, "%lf", &valor) == 1)
+                total++;
+            rewind(archivo);
 
-        printf("==========================================\n");
-        printf("Datos cargados: %ld\n", total);
-        printf("Valor mínimo: %.2f\n", min);
-        printf("Valor máximo: %.2f\n", max);
-        printf("Promedio: %.2f\n", promedio);
-        printf("Memoria usada: %.2f MB\n", memoria);
-        printf("\nProcesos MPI: %d\n", size);
-        printf("Dividiendo datos entre procesos...\n");
-        printf("==========================================\n");
+            // Reservar memoria y cargar todos los datos
+            datos = (double *)malloc(total * sizeof(double));
+            for (long i = 0; i < total; i++)
+                fscanf(archivo, "%lf", &datos[i]);
+            fclose(archivo);
+
+            double memoria_usada = (total * sizeof(double)) / (1024.0 * 1024.0);
+            printf("\n[Iteración %d] Dataset cargado: %ld elementos\n", rep + 1, total);
+            printf("Memoria usada: %.2f MB\n", memoria_usada);
+        }
+
+        // ===========================================================
+        // DIFUSIÓN DE INFORMACIÓN (Maestro → Esclavos)
+        // El maestro informa a todos cuántos datos hay en total
+        // ===========================================================
+        MPI_Bcast(&total, 1, MPI_LONG, 0, MPI_COMM_WORLD);
+
+        long base = total / size;
+        long resto = total % size;
+
+        // Cálculo de cuántos elementos tendrá cada proceso
+        int *cuentas = (int *)malloc(size * sizeof(int));
+        int *desplazamientos = (int *)malloc(size * sizeof(int));
+
+        for (int i = 0; i < size; i++) {
+            cuentas[i] = (int)(base + (i == size - 1 ? resto : 0));
+            desplazamientos[i] = (i == 0) ? 0 : desplazamientos[i - 1] + cuentas[i - 1];
+        }
+
+        // Cada proceso (maestro y esclavos) reserva su buffer local
+        double *subdatos = (double *)malloc(cuentas[rank] * sizeof(double));
+
+        // ===========================================================
+        // DISTRIBUCIÓN DE TRABAJO (Scatterv)
+        // El maestro reparte fragmentos del arreglo a cada esclavo
+        // ===========================================================
+        MPI_Scatterv(datos, cuentas, desplazamientos, MPI_DOUBLE,
+                     subdatos, cuentas[rank], MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+        // ===========================================================
+        // ROL DE LOS ESCLAVOS
+        // Cada proceso ordena su subconjunto de datos localmente
+        // ===========================================================
+        qsort(subdatos, cuentas[rank], sizeof(double), comparar);
+
+        // ===========================================================
+        // RECOLECCIÓN DE RESULTADOS (Gatherv)
+        // Los esclavos devuelven los datos ordenados al maestro
+        // ===========================================================
+        double *resultado_final = NULL;
+        if (rank == 0)
+            resultado_final = (double *)malloc(total * sizeof(double));
+
+        MPI_Gatherv(subdatos, cuentas[rank], MPI_DOUBLE,
+                    resultado_final, cuentas, desplazamientos, MPI_DOUBLE,
+                    0, MPI_COMM_WORLD);
+
+        // ===========================================================
+        // ROL DEL MAESTRO: FUSIÓN FINAL
+        // Combina los fragmentos ya ordenados de todos los esclavos
+        // ===========================================================
+        if (rank == 0) {
+            double *temp = (double *)malloc(total * sizeof(double));
+            long acumulado = cuentas[0];
+
+            for (int i = 1; i < size; i++) {
+                merge(resultado_final, acumulado,
+                      resultado_final + acumulado, cuentas[i], temp);
+                acumulado += cuentas[i];
+
+                // Copiar la parte fusionada de nuevo
+                for (long k = 0; k < acumulado; k++)
+                    resultado_final[k] = temp[k];
+            }
+            free(temp);
+
+            // -------------------------------------------------------
+            // Verificación del resultado y tiempo total
+            // -------------------------------------------------------
+            double fin_global = MPI_Wtime();
+            double duracion = fin_global - inicio_global;
+            tiempo_total += duracion;
+
+            if (!verificar_orden(resultado_final, total))
+                printf("⚠️  Advertencia: el arreglo final no está completamente ordenado.\n");
+
+            printf("Iteración %d completada en %.6f segundos\n", rep + 1, duracion);
+
+            free(resultado_final);
+            free(datos);
+        }
+
+        // Liberar memoria temporal
+        free(subdatos);
+        free(cuentas);
+        free(desplazamientos);
     }
 
-    // Difundir total
-    MPI_Bcast(&total, 1, MPI_LONG, 0, MPI_COMM_WORLD);
-
-    long tam_local = total / size;
-    subdatos = (double *)malloc(tam_local * sizeof(double));
-    if (!subdatos) {
-        fprintf(stderr, "Error: no se pudo asignar memoria en proceso %d\n", rank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    // Enviar partes
-    MPI_Scatter(datos, tam_local, MPI_DOUBLE, subdatos, tam_local, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    inicio_global = tiempo_actual();
-
-    qsort(subdatos, tam_local, sizeof(double), comparar);
-
-    MPI_Gather(subdatos, tam_local, MPI_DOUBLE, datos, tam_local, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
+    // ===============================================================
+    // PROMEDIO FINAL Y REPORTE
+    // Solo el maestro imprime y guarda los resultados
+    // ===============================================================
     if (rank == 0) {
-        double *temp = (double *)malloc(total * sizeof(double));
-        long paso = tam_local;
-        for (int p = 1; p < size; p++) {
-            fusionar(datos, paso * p, &datos[p * tam_local], tam_local, temp);
-            for (long i = 0; i < (paso * (p + 1)); i++)
-                datos[i] = temp[i];
-        }
-        free(temp);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    fin_global = tiempo_actual();
-
-    if (rank == 0) {
-        double tiempo = fin_global - inicio_global;
-        double memoria = memoria_usada_MB();
-
-        printf("Tiempo total de ordenamiento paralelo: %.6f segundos\n", tiempo);
-        printf("Memoria usada: %.2f MB\n", memoria);
-
-        if (verificar_orden(datos, total))
-            printf("Verificación: datos correctamente ordenados \n");
-        else
-            printf("Error: datos no ordenados \n");
+        double tiempo_promedio = tiempo_total / REPETICIONES;
+        printf("\n=====================================\n");
+        printf("MPI Maestro–Esclavo (Optimizado)\n");
+        printf("Procesos totales: %d\n", size);
+        printf("Tiempo promedio: %.6f segundos\n", tiempo_promedio);
+        printf("=====================================\n");
 
         FILE *res = fopen("resultados_mpi.csv", "a");
         if (res) {
-            fprintf(res, "%d,%.6f,%.2f\n", size, tiempo, memoria);
+            fprintf(res, "%d,%.6f\n", size, tiempo_promedio);
             fclose(res);
+        } else {
+            fprintf(stderr, "Advertencia: no se pudo guardar resultados_mpi.csv\n");
         }
-
-        printf("==========================================\n");
-        free(datos);
     }
 
-    free(subdatos);
     MPI_Finalize();
     return 0;
 }
