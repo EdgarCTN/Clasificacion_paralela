@@ -10,7 +10,7 @@ gcc secuencial.c -o secuencial -O2
 ## 2. Ejecutar
 ./secuencial
 
-# Clasificacion paralela - MPI
+# Clasificacion paralela - MPI (Divide y venceras)
 ## 1. Instalar MPI
 sudo apt update  
 sudo apt install -y openmpi-bin openmpi-common libopenmpi-dev
