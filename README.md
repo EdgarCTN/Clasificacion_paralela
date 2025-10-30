@@ -21,9 +21,8 @@ gcc secuencial.c -o secuencial -O2
 ## 1. Compilar
 mpicc mpi.c -o mpi
 
-mpirun -H master,client1,client2 -np 3 ./mpi
 ## 2. Ejecutar
-mpicc mpi.c -o mpi -O2
+mpirun -H master,client1,client2 -np 3 ./mpi
 
 # Clasificacion paralela - OpenMP (Divide y venceras)
 ## 1. Compilar
