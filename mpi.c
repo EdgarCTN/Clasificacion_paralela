@@ -180,7 +180,7 @@ int main(int argc, char *argv[]) {
             tiempo_total += duracion;
 
             if (!verificar_orden(resultado_final, total))
-                printf("⚠️  Advertencia: el arreglo final no está completamente ordenado.\n");
+                printf("Advertencia: el arreglo final no está completamente ordenado.\n");
 
             printf("Iteración %d completada en %.6f segundos\n", rep + 1, duracion);
 
