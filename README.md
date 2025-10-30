@@ -17,16 +17,13 @@ gcc secuencial.c -o secuencial -O2
 ## 2. Ejecutar
 ./secuencial
 
-# Clasificacion paralela - MPI (Divide y venceras)
-## 1. Instalar MPI
-sudo apt update  
-sudo apt install -y openmpi-bin openmpi-common libopenmpi-dev
+# Clasificacion paralela - MPI (Maestro y esclavo)
+## 1. Compilar
+mpicc mpi.c -o mpi
 
-## 2. Compilar
+mpirun -H master,client1,client2 -np 3 ./mpi
+## 2. Ejecutar
 mpicc mpi.c -o mpi -O2
-
-## 3. Ejecutar
-mpirun -np 2 ./mpi
 
 # Clasificacion paralela - OpenMP (Divide y venceras)
 ## 1. Compilar
