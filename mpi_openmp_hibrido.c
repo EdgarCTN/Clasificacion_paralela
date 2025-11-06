@@ -4,22 +4,45 @@
 #include <omp.h>
 #include <math.h>
 #include <limits.h>
+#include <string.h>
+#include <errno.h>
 
 #define REPETICIONES 5
-#define UMBRAL_TASK 10000  // tamaño mínimo para crear tareas (ajustable)
+#define UMBRAL_TASK 50000  // aumentado para reducir overhead de tareas
+#define INSERTION_SORT_THRESHOLD 64  // para subarreglos pequeños usar insertion sort
 
-/* Comparador (no usado por quicksort_parallel pero útil) */
+/* Comparador (para qsort si se necesitara) */
 int comparar_double(const void *a, const void *b) {
     double x = *(double *)a;
     double y = *(double *)b;
     return (x > y) - (x < y);
 }
 
-/* QuickSort paralelo con OpenMP (divide & conquer con tareas) */
+/* Insertion sort para subarreglos pequeños */
+void insertion_sort(double *arr, long left, long right) {
+    for (long i = left + 1; i <= right; ++i) {
+        double key = arr[i];
+        long j = i - 1;
+        while (j >= left && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            --j;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+/* QuickSort paralelo con OpenMP (divide & conquer con tareas).
+   Cambios: si el subarreglo es pequeño, usar insertion_sort. */
 void quicksort_parallel(double *arr, long left, long right, int profundidad) {
     if (left >= right) return;
+    long len = right - left + 1;
+    if (len <= INSERTION_SORT_THRESHOLD) {
+        insertion_sort(arr, left, right);
+        return;
+    }
+
     long i = left, j = right;
-    double pivote = arr[(left + right) / 2];
+    double pivote = arr[left + (right - left) / 2];
     while (i <= j) {
         while (arr[i] < pivote) i++;
         while (arr[j] > pivote) j--;
@@ -45,18 +68,52 @@ void quicksort_parallel(double *arr, long left, long right, int profundidad) {
     }
 }
 
-/* Merge de dos arreglos ordenados */
+/* Merge de dos arreglos ordenados (devuelve nuevo buffer que debe liberarse) */
 double *merge_two(const double *a, long na, const double *b, long nb) {
     double *out = malloc((na + nb) * sizeof(double));
     if (!out) return NULL;
-    long i = 0, j = 0, k = 0;
-    while (i < na && j < nb) {
-        if (a[i] <= b[j]) out[k++] = a[i++];
-        else out[k++] = b[j++];
+    long ia = 0, ib = 0, k = 0;
+    while (ia < na && ib < nb) {
+        if (a[ia] <= b[ib]) out[k++] = a[ia++];
+        else out[k++] = b[ib++];
     }
-    while (i < na) out[k++] = a[i++];
-    while (j < nb) out[k++] = b[j++];
+    while (ia < na) out[k++] = a[ia++];
+    while (ib < nb) out[k++] = b[ib++];
     return out;
+}
+
+/* Lectura rápida de CSV usando getline + strtod */
+double *read_csv_fast(const char *filename, long *out_total) {
+    FILE *f = fopen(filename, "r");
+    if (!f) return NULL;
+
+    char *line = NULL;
+    size_t len = 0;
+    long capacity = 1024;
+    long total = 0;
+    double *arr = malloc(capacity * sizeof(double));
+    if (!arr) { fclose(f); return NULL; }
+
+    while (getline(&line, &len, f) != -1) {
+        char *endptr = NULL;
+        errno = 0;
+        double val = strtod(line, &endptr);
+        if (endptr == line) continue; // línea vacía o no numérica
+        if (errno != 0 && val == 0.0) continue;
+        if (total >= capacity) {
+            long newcap = capacity * 2;
+            double *tmp = realloc(arr, newcap * sizeof(double));
+            if (!tmp) { free(arr); free(line); fclose(f); return NULL; }
+            arr = tmp;
+            capacity = newcap;
+        }
+        arr[total++] = val;
+    }
+
+    free(line);
+    fclose(f);
+    *out_total = total;
+    return arr;
 }
 
 int main(int argc, char *argv[]) {
@@ -74,7 +131,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Configurar OpenMP: fijar número de hilos detectado por entorno */
     int omp_threads = omp_get_max_threads();
+    omp_set_dynamic(0);
+    omp_set_num_threads(omp_threads);
     int max_depth = (int)log2((omp_threads > 0) ? omp_threads : 1);
     if (max_depth < 1) max_depth = 1;
 
@@ -82,35 +142,18 @@ int main(int argc, char *argv[]) {
 
     for (int rep = 0; rep < REPETICIONES; ++rep) {
         double t0 = MPI_Wtime();
-        double *datos = NULL;
+        double *datos = NULL;   // solo en rank 0 contiene todo
         long total = 0;
         double t_io_start = 0.0, t_io_end = 0.0;
 
         if (rank == 0) {
             t_io_start = MPI_Wtime();
-            FILE *f = fopen("dataset.csv", "r");
-            if (!f) {
-                fprintf(stderr, "Error: no se pudo abrir dataset.csv\n");
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
-            double tmp;
-            while (fscanf(f, "%lf", &tmp) == 1) total++;
-            rewind(f);
-
-            datos = malloc(total * sizeof(double));
-            if (!datos) {
-                fprintf(stderr, "Error: malloc datos falló (total=%ld)\n", total);
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
-
-            for (long i = 0; i < total; ++i) {
-                if (fscanf(f, "%lf", &datos[i]) != 1) {
-                    fprintf(stderr, "Error leyendo dato %ld\n", i);
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-            }
-            fclose(f);
+            datos = read_csv_fast("dataset.csv", &total);
             t_io_end = MPI_Wtime();
+            if (!datos) {
+                fprintf(stderr, "Error: no se pudo leer dataset.csv (rank 0)\n");
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
 
             printf("[Rep %d] Dataset cargado: %ld elementos\n", rep + 1, total);
             printf("Memoria usada (maestro, solo datos): %.2f MB\n",
@@ -126,7 +169,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* Construir counts/displs (long) y versiones int para MPI_Scatterv */
+        /* Construir counts/displs (long) y versiones int para MPI_Scatterv/Gatherv */
         int k = size;
         long *counts = malloc(k * sizeof(long));
         long *displs = malloc(k * sizeof(long));
@@ -155,7 +198,7 @@ int main(int argc, char *argv[]) {
         double *local = malloc((local_n > 0 ? local_n : 1) * sizeof(double));
         if (!local) MPI_Abort(MPI_COMM_WORLD, 1);
 
-        /* Scatterv */
+        /* Scatterv desde root a todos */
         double t_scatter_start = MPI_Wtime();
         MPI_Scatterv(datos, scounts, sdispls, MPI_DOUBLE, local, (int)local_n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         double t_scatter_end = MPI_Wtime();
@@ -169,58 +212,72 @@ int main(int argc, char *argv[]) {
         }
         double t_sort_end = MPI_Wtime();
 
-        /* Merge en árbol: cada proceso mantiene cur_data y owns_data */
-        double *cur_data = local;
-        long cur_n = local_n;
-        int owns_data = 1; // inicialmente cada proceso "posee" local
-
+        /* --- NUEVO: recolección mediante Gatherv al root y merge seguro allí --- */
         double t_merge_start = MPI_Wtime();
-        for (int step = 1; step < size; step <<= 1) {
-            if (rank % (2 * step) == 0) {
-                int partner = rank + step;
-                if (partner < size) {
-                    /* recibir count (MPI_LONG) */
-                    long recv_count = 0;
-                    MPI_Recv(&recv_count, 1, MPI_LONG, partner, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    if (recv_count < 0) { fprintf(stderr, "recv_count negativo\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
 
-                    /* reservar buffer y recibir datos */
-                    double *recv_buf = malloc((recv_count > 0 ? recv_count : 1) * sizeof(double));
-                    if (!recv_buf && recv_count > 0) MPI_Abort(MPI_COMM_WORLD, 1);
-                    MPI_Recv(recv_buf, (int)recv_count, MPI_DOUBLE, partner, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        /* En root reservamos buffer para recibir todos los datos ordenados */
+        double *gather_buf = NULL;
+        if (rank == 0) {
+            gather_buf = malloc((total > 0 ? total : 1) * sizeof(double));
+            if (!gather_buf && total > 0) MPI_Abort(MPI_COMM_WORLD, 1);
+        }
 
-                    /* merge cur_data + recv_buf -> merged */
-                    double *merged = merge_two(cur_data, cur_n, recv_buf, recv_count);
-                    if (!merged) { fprintf(stderr, "merge_two devolvió NULL\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+        /* Todos envían su bloque local ordenado al root */
+        MPI_Gatherv(local, (int)local_n, MPI_DOUBLE,
+                    gather_buf, scounts, sdispls, MPI_DOUBLE,
+                    0, MPI_COMM_WORLD);
 
-                    /* liberar antiguos buffers con control */
-                    if (owns_data && cur_data) {
-                        free(cur_data);
-                        cur_data = NULL;
-                        owns_data = 0;
-                    }
-                    if (recv_buf) free(recv_buf);
-
-                    /* adoptar merged */
-                    cur_data = merged;
-                    cur_n = cur_n + recv_count;
-                    owns_data = 1; // ahora poseemos merged
-                }
+        /* Root hace merge iterativo de las porciones ya ordenadas */
+        double *cur_data = NULL;
+        long cur_n = 0;
+        int owns_data = 0;
+        if (rank == 0) {
+            /* Inicializar cur_data con la porción del rank 0 que ya está en gather_buf */
+            if (scounts[0] > 0) {
+                cur_data = malloc(scounts[0] * sizeof(double));
+                if (!cur_data && scounts[0] > 0) MPI_Abort(MPI_COMM_WORLD, 1);
+                memcpy(cur_data, gather_buf + sdispls[0], scounts[0] * sizeof(double));
+                cur_n = scounts[0];
+                owns_data = 1;
             } else {
-                int partner = rank - step;
-                /* enviar cur_n y cur_data a partner, luego abandonar */
-                MPI_Send(&cur_n, 1, MPI_LONG, partner, 0, MPI_COMM_WORLD);
-                MPI_Send(cur_data, (int)cur_n, MPI_DOUBLE, partner, 1, MPI_COMM_WORLD);
-                /* después de enviar, liberamos si poseemos buffer */
-                if (owns_data && cur_data) {
-                    free(cur_data);
-                    cur_data = NULL;
-                    owns_data = 0;
-                }
+                /* Si por alguna razón scounts[0]==0, empezar con vacío */
+                cur_data = NULL;
                 cur_n = 0;
-                break;
+                owns_data = 0;
+            }
+
+            /* Merge iterativo con las porciones 1..k-1 */
+            for (int src = 1; src < k; ++src) {
+                long src_n = counts[src];
+                if (src_n == 0) continue;
+                double *src_ptr = gather_buf + sdispls[src];
+
+                /* merge cur_data (cur_n) con src_ptr (src_n) -> merged */
+                double *merged = NULL;
+                if (cur_n == 0) {
+                    /* simplemente copiar src_ptr */
+                    merged = malloc(src_n * sizeof(double));
+                    if (!merged && src_n > 0) MPI_Abort(MPI_COMM_WORLD, 1);
+                    memcpy(merged, src_ptr, src_n * sizeof(double));
+                    /* liberar cur_data si existía */
+                    if (owns_data && cur_data) { free(cur_data); cur_data = NULL; owns_data = 0; }
+                    cur_data = merged;
+                    cur_n = src_n;
+                    owns_data = 1;
+                } else {
+                    merged = merge_two(cur_data, cur_n, src_ptr, src_n);
+                    if (!merged) { fprintf(stderr, "merge_two devolvió NULL en root\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+                    /* liberar antiguo cur_data */
+                    if (owns_data && cur_data) { free(cur_data); cur_data = NULL; owns_data = 0; }
+                    cur_data = merged;
+                    cur_n = cur_n + src_n;
+                    owns_data = 1;
+                }
             }
         }
+
+        /* Root ya tiene cur_data con todos los datos ordenados (si quieres puedes usarlo aquí) */
+
         double t_merge_end = MPI_Wtime();
 
         /* Recolección de tiempos (máximos por etapa) */
@@ -251,15 +308,18 @@ int main(int argc, char *argv[]) {
         /* Liberaciones finales: solo lo que se posea */
         if (rank == 0) {
             if (datos) { free(datos); datos = NULL; }
-        }
-        if (owns_data && cur_data) {
-            free(cur_data);
-            cur_data = NULL;
-            owns_data = 0;
+            if (gather_buf) { free(gather_buf); gather_buf = NULL; }
+            if (owns_data && cur_data) { free(cur_data); cur_data = NULL; owns_data = 0; }
+        } else {
+            /* otros ranks no deben liberar cur_data (no lo tienen) */
         }
 
-        free(counts); free(displs); free(scounts); free(sdispls);
-        // local fue liberado por la lógica de owns_data; no liberar aquí.
+        if (local) { free(local); local = NULL; }
+
+        free(counts); counts = NULL;
+        free(displs); displs = NULL;
+        free(scounts); scounts = NULL;
+        free(sdispls); sdispls = NULL;
     } // fin repeticiones
 
     if (rank == 0) {
