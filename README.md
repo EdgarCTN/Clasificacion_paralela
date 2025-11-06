@@ -54,3 +54,13 @@ nvcc cuda_sort.cu -o cuda_sort.exe -O3 -std=c++17
 ## 4. Salida
 - `dataset_ordenado.csv` - Dataset ordenado completo
 - `resultados_cuda.csv` - Estadísticas de rendimiento
+
+# Clasificacion paralela  Hibrida- OpenMP y MPI
+## 1. Compilar
+mpicc -fopenmp -O2 mpi_openmp_hibrido.c -o mpi_openmp_hibrido -lm
+
+## 2. Definir hilos
+OMP_NUM_THREADS=4
+
+## 3. Ejecutar
+mpirun -H master,client1,client2 -np 3 ./mpi_openmp_hibrido
