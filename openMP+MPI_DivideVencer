@@ -1,0 +1,397 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <mpi.h>
+#include <omp.h>
+#include <math.h>
+#include <limits.h>
+#include <string.h>
+#include <errno.h>
+
+#define REPETICIONES 5
+#define UMBRAL_TASK 50000
+#define INSERTION_SORT_THRESHOLD 64
+
+int comparar_double(const void *a, const void *b) {
+    double x = *(double *)a;
+    double y = *(double *)b;
+    return (x > y) - (x < y);
+}
+
+void insertion_sort(double *arr, long left, long right) {
+    for (long i = left + 1; i <= right; ++i) {
+        double key = arr[i];
+        long j = i - 1;
+        while (j >= left && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            --j;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+void quicksort_parallel(double *arr, long left, long right, int profundidad) {
+    if (left >= right) return;
+    long len = right - left + 1;
+    if (len <= INSERTION_SORT_THRESHOLD) {
+        insertion_sort(arr, left, right);
+        return;
+    }
+
+    long i = left, j = right;
+    double pivote = arr[left + (right - left) / 2];
+    while (i <= j) {
+        while (arr[i] < pivote) i++;
+        while (arr[j] > pivote) j--;
+        if (i <= j) {
+            double tmp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = tmp;
+            i++; j--;
+        }
+    }
+
+    if (profundidad > 0 && (right - left) > UMBRAL_TASK) {
+        #pragma omp task shared(arr) firstprivate(left, j, profundidad)
+        quicksort_parallel(arr, left, j, profundidad - 1);
+
+        #pragma omp task shared(arr) firstprivate(i, right, profundidad)
+        quicksort_parallel(arr, i, right, profundidad - 1);
+
+        #pragma omp taskwait
+    } else {
+        if (left < j) quicksort_parallel(arr, left, j, 0);
+        if (i < right) quicksort_parallel(arr, i, right, 0);
+    }
+}
+
+double *merge_two(const double *a, long na, const double *b, long nb) {
+    double *out = malloc((na + nb) * sizeof(double));
+    if (!out) return NULL;
+    long ia = 0, ib = 0, k = 0;
+    while (ia < na && ib < nb) {
+        if (a[ia] <= b[ib]) out[k++] = a[ia++];
+        else out[k++] = b[ib++];
+    }
+    while (ia < na) out[k++] = a[ia++];
+    while (ib < nb) out[k++] = b[ib++];
+    return out;
+}
+
+double *read_csv_parallel(const char *filename, long *out_count, MPI_Comm comm) {
+    int rank, nprocs;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &nprocs);
+
+    MPI_File fh;
+    MPI_Offset file_size = 0;
+    if (MPI_File_open(comm, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh) != MPI_SUCCESS) {
+        if (rank == 0) fprintf(stderr, "Error: no se pudo abrir %s\n", filename);
+        MPI_Barrier(comm);
+        return NULL;
+    }
+    MPI_File_get_size(fh, &file_size);
+    if (file_size == 0) {
+        MPI_File_close(&fh);
+        *out_count = 0;
+        return NULL;
+    }
+
+    MPI_Offset chunk = file_size / nprocs;
+    MPI_Offset start = rank * chunk;
+    MPI_Offset end = (rank == nprocs - 1) ? (file_size - 1) : (start + chunk - 1);
+    MPI_Offset read_len = end - start + 1;
+
+    const MPI_Offset EXTRA = 1024;
+    MPI_Offset alloc_len = (size_t)(read_len + EXTRA + 1);
+    char *buf = malloc((size_t)alloc_len);
+    if (!buf) {
+        MPI_File_close(&fh);
+        return NULL;
+    }
+    memset(buf, 0, (size_t)alloc_len);
+
+    MPI_Status st;
+    MPI_File_read_at_all(fh, start, buf, (int)(read_len + EXTRA), MPI_CHAR, &st);
+
+    size_t local_begin = 0;
+    if (start != 0) {
+        char *p = memchr(buf, '\n', (size_t)read_len + (size_t)EXTRA);
+        if (p) local_begin = (size_t)(p - buf) + 1;
+    }
+
+    size_t local_end = (size_t)(read_len + EXTRA);
+    if (rank != nprocs - 1) {
+        char *last_nl = NULL;
+        char *p = buf;
+        char *endptr = buf + (size_t)(read_len + EXTRA);
+        while (p < endptr) {
+            char *q = memchr(p, '\n', (size_t)(endptr - p));
+            if (!q) break;
+            last_nl = q;
+            p = q + 1;
+        }
+        if (last_nl) local_end = (size_t)(last_nl - buf) + 1;
+    }
+
+    if (local_end <= local_begin) {
+        free(buf);
+        MPI_File_close(&fh);
+        *out_count = 0;
+        return NULL;
+    }
+
+    char *parse_ptr = buf + local_begin;
+    char *parse_end = buf + local_end;
+    size_t capacity = 1024;
+    size_t count = 0;
+    double *arr = malloc(capacity * sizeof(double));
+    if (!arr) {
+        free(buf);
+        MPI_File_close(&fh);
+        return NULL;
+    }
+
+    while (parse_ptr < parse_end) {
+        char *nl = memchr(parse_ptr, '\n', (size_t)(parse_end - parse_ptr));
+        size_t linelen = nl ? (size_t)(nl - parse_ptr) : (size_t)(parse_end - parse_ptr);
+        if (linelen == 0) {
+            if (!nl) break;
+            parse_ptr = nl + 1;
+            continue;
+        }
+
+        char *linebuf = malloc(linelen + 1);
+        if (!linebuf) {
+            free(arr); free(buf); MPI_File_close(&fh);
+            return NULL;
+        }
+        memcpy(linebuf, parse_ptr, linelen);
+        linebuf[linelen] = '\0';
+
+        char *endptr = NULL;
+        errno = 0;
+        double v = strtod(linebuf, &endptr);
+        if (endptr != linebuf && !(errno != 0 && v == 0.0)) {
+            if (count >= capacity) {
+                size_t nc = capacity * 2;
+                double *tmp = realloc(arr, nc * sizeof(double));
+                if (!tmp) {
+                    free(linebuf); free(arr); free(buf); MPI_File_close(&fh);
+                    return NULL;
+                }
+                arr = tmp;
+                capacity = nc;
+            }
+            arr[count++] = v;
+        }
+        free(linebuf);
+
+        if (!nl) break;
+        parse_ptr = nl + 1;
+    }
+
+    free(buf);
+    MPI_File_close(&fh);
+
+    if (count == 0) {
+        free(arr);
+        arr = NULL;
+    } else {
+        double *tmp = realloc(arr, count * sizeof(double));
+        if (tmp) arr = tmp;
+    }
+    *out_count = (long)count;
+    return arr;
+}
+
+void merge_distribuido(double **local_data, long *local_count, MPI_Comm comm) {
+    int rank, nprocs;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &nprocs);
+    
+    int step = 1;
+    while (step < nprocs) {
+        if (rank % (2 * step) == 0) {
+            /* Este proceso RECIBE del proceso rank + step */
+            int source = rank + step;
+            if (source < nprocs) {
+                /* Recibir tamaño usando comunicación bloqueante simple */
+                long recv_count = 0;
+                MPI_Status status;
+                MPI_Recv(&recv_count, 1, MPI_LONG, source, 0, comm, &status);
+                
+                if (recv_count > 0) {
+                    /* Alocar buffer y recibir datos con Irecv para overlapping */
+                    double *recv_data = malloc(recv_count * sizeof(double));
+                    if (!recv_data) MPI_Abort(comm, 1);
+                    
+                    MPI_Request req;
+                    MPI_Irecv(recv_data, recv_count, MPI_DOUBLE, source, 1, comm, &req);
+                    
+                    /* Mientras recibimos, podemos preparar buffers */
+                    double *merged = malloc((*local_count + recv_count) * sizeof(double));
+                    if (!merged) MPI_Abort(comm, 1);
+                    
+                    /* Esperar a que termine la recepción */
+                    MPI_Wait(&req, MPI_STATUS_IGNORE);
+                    
+                    /* Hacer merge eficiente in-place */
+                    long ia = 0, ib = 0, k = 0;
+                    while (ia < *local_count && ib < recv_count) {
+                        if ((*local_data)[ia] <= recv_data[ib]) {
+                            merged[k++] = (*local_data)[ia++];
+                        } else {
+                            merged[k++] = recv_data[ib++];
+                        }
+                    }
+                    while (ia < *local_count) merged[k++] = (*local_data)[ia++];
+                    while (ib < recv_count) merged[k++] = recv_data[ib++];
+                    
+                    /* Liberar datos antiguos y actualizar */
+                    free(*local_data);
+                    free(recv_data);
+                    *local_data = merged;
+                    *local_count = *local_count + recv_count;
+                }
+            }
+        } else if ((rank - step) % (2 * step) == 0) {
+            /* Este proceso ENVÍA al proceso rank - step */
+            int dest = rank - step;
+            
+            /* Enviar tamaño y datos usando Isend para no bloquear */
+            MPI_Request req[2];
+            MPI_Isend(local_count, 1, MPI_LONG, dest, 0, comm, &req[0]);
+            
+            if (*local_count > 0) {
+                MPI_Isend(*local_data, *local_count, MPI_DOUBLE, dest, 1, comm, &req[1]);
+                /* Esperar a que termine el envío antes de liberar */
+                MPI_Waitall(2, req, MPI_STATUSES_IGNORE);
+            } else {
+                MPI_Wait(&req[0], MPI_STATUS_IGNORE);
+            }
+            
+            /* Este proceso ya terminó su trabajo */
+            if (*local_data) {
+                free(*local_data);
+                *local_data = NULL;
+                *local_count = 0;
+            }
+            break;
+        }
+        step *= 2;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (size < 2) {
+        if (rank == 0) fprintf(stderr, "Se requieren al menos 2 procesos\n");
+        MPI_Finalize();
+        return 1;
+    }
+
+    int omp_threads = omp_get_max_threads();
+    omp_set_dynamic(0);
+    omp_set_num_threads(omp_threads);
+    int max_depth = (int)log2((omp_threads > 0) ? omp_threads : 1);
+    if (max_depth < 1) max_depth = 1;
+
+    double tiempo_total_prom = 0.0;
+
+    for (int rep = 0; rep < REPETICIONES; ++rep) {
+        /* Sincronizar antes de empezar para mediciones justas */
+        MPI_Barrier(MPI_COMM_WORLD);
+        
+        double t0 = MPI_Wtime();
+        
+        /* FASE 1: LECTURA PARALELA (cada proceso lee su chunk) */
+        double t_io_start = MPI_Wtime();
+        long local_count = 0;
+        double *local_data = read_csv_parallel("dataset.csv", &local_count, MPI_COMM_WORLD);
+        double t_io_end = MPI_Wtime();
+        
+        /* Esperar a que todos terminen I/O antes de continuar */
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        long total = 0;
+        MPI_Allreduce(&local_count, &total, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+
+        if (rank == 0) {
+            printf("[Rep %d] Total elementos: %ld\n", rep + 1, total);
+            printf("I/O paralelo: %.6f s\n", t_io_end - t_io_start);
+        }
+
+        if (total == 0) {
+            if (rank == 0) fprintf(stderr, "Dataset vacío\n");
+            MPI_Finalize();
+            return 1;
+        }
+
+        /* FASE 2: ORDENAMIENTO LOCAL PARALELO (OpenMP) */
+        double t_sort_start = MPI_Wtime();
+        if (local_count > 0) {
+            #pragma omp parallel
+            {
+                #pragma omp single
+                quicksort_parallel(local_data, 0, local_count - 1, max_depth);
+            }
+        }
+        double t_sort_end = MPI_Wtime();
+
+        /* FASE 3: MERGE DISTRIBUIDO - DIVIDE Y VENCERÁS PURO */
+        double t_merge_start = MPI_Wtime();
+        merge_distribuido(&local_data, &local_count, MPI_COMM_WORLD);
+        double t_merge_end = MPI_Wtime();
+
+        /* Recolección de tiempos máximos */
+        double io_time = t_io_end - t_io_start;
+        double sort_time = t_sort_end - t_sort_start;
+        double merge_time = t_merge_end - t_merge_start;
+
+        double max_io, max_sort, max_merge;
+        MPI_Reduce(&io_time, &max_io, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&sort_time, &max_sort, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&merge_time, &max_merge, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+        /* Memoria */
+        double local_mem = ((double)local_count * sizeof(double)) / (1024.0 * 1024.0);
+        double sum_mem = 0.0;
+        MPI_Reduce(&local_mem, &sum_mem, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        if (rank == 0) {
+            double dur_total = MPI_Wtime() - t0;
+            tiempo_total_prom += dur_total;
+            printf("Rep %d: I/O=%.6f sort=%.6f merge_dist=%.6f total=%.6f\n",
+                   rep + 1, max_io, max_sort, max_merge, dur_total);
+            printf("Memoria total: %.2f MB\n", sum_mem);
+        }
+
+        /* Liberar memoria local */
+        if (local_data) {
+            free(local_data);
+            local_data = NULL;
+        }
+    }
+
+    if (rank == 0) {
+        double promedio = tiempo_total_prom / REPETICIONES;
+        printf("\n=== Resultados obtenidos ===\n");
+        printf("Procesos MPI: %d\n", size);
+        printf("Hilos OpenMP: %d\n", omp_get_max_threads());
+        printf("Tiempo promedio: %.6f s\n", promedio);
+        printf("==============================\n");
+
+        FILE *f = fopen("resultados.csv", "a");
+        if (f) {
+            fprintf(f, "%d,%d,%.6f\n", size, omp_get_max_threads(), promedio);
+            fclose(f);
+        }
+    }
+
+    MPI_Finalize();
+    return 0;
+}
