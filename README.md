@@ -69,8 +69,9 @@ mpirun -H master,client1,client2 -np 3 ./mpi_openmp_hibrido
 # Interfaz
 
 ## 1) Instalar dependencias necesarias
+```bash
 sudo apt install python3-tk python3-matplotlib -y
-
+```
 ## 2) Opciones para configurar MPI en WSL
 (Este programa se hizo considerando que uses WSL y que solo tengas un núcleo)
 
@@ -81,12 +82,16 @@ nano hostfile
 localhost slots=3
 
 ## 3) Ejecutar el programa MPI
+```bash
 mpirun -np 3 --hostfile hostfile ./mpi
-
+```
 ## 4) Ejecutar la interfaz gráfica
+```bash
 nano gui.py
+```
+```bash
 python3 gui.py
-
+```
 
 
 
